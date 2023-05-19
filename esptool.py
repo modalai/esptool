@@ -13,6 +13,7 @@
 import contextlib
 import os
 import sys
+import time
 
 if os.name != "nt":
     # Linux/macOS: remove current script directory to avoid importing this file
@@ -31,4 +32,8 @@ if os.name != "nt":
 import esptool
 
 if __name__ == "__main__":
+    print("-----------STARTING PERF COUNTER-----------")
+    start = time.perf_counter()
     esptool._main()
+    stop = time.perf_counter()
+    print(f"-----------TOTAL ELAPSED TIME: {stop-start} seconds-----------")

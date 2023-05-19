@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+#
 # SPDX-FileCopyrightText: 2014-2022 Fredrik Ahlberg, Angus Gratton,
 # Espressif Systems (Shanghai) CO LTD, other contributors as noted.
 #
@@ -28,7 +30,7 @@ __all__ = [
     "write_mem",
 ]
 
-__version__ = "4.6-dev"
+__version__ = "4.2.1"
 
 import argparse
 import inspect
@@ -36,7 +38,6 @@ import os
 import shlex
 import sys
 import time
-import traceback
 
 from esptool.cmds import (
     chip_id,
@@ -63,17 +64,13 @@ from esptool.cmds import (
     write_flash_status,
     write_mem,
 )
-from esptool.config import load_config_file
 from esptool.loader import DEFAULT_CONNECT_ATTEMPTS, ESPLoader, list_ports
-from esptool.targets import CHIP_DEFS, CHIP_LIST, ESP32ROM
+from esptool.targets import CHIP_DEFS, CHIP_LIST, ESP32ROM, ESP8266ROM
 from esptool.util import (
     FatalError,
     NotImplementedInROMError,
     flash_size_bytes,
-    strip_chip_name,
 )
-
-import serial
 
 
 def main(argv=None, esp=None):
@@ -101,7 +98,7 @@ def main(argv=None, esp=None):
         "--chip",
         "-c",
         help="Target chip type",
-        type=strip_chip_name,
+        type=lambda c: c.lower().replace("-", ""),  # support ESP32-S2, etc.
         choices=["auto"] + CHIP_LIST,
         default=os.environ.get("ESPTOOL_CHIP", "auto"),
     )
@@ -112,6 +109,14 @@ def main(argv=None, esp=None):
         help="Serial port device",
         default=os.environ.get("ESPTOOL_PORT", None),
     )
+
+    # ELRS vvv
+    parser.add_argument(
+        "--passthrough",
+        help="Doing passthrough flashing, so just use one baudrate for all communications",
+        action="store_true",
+    )
+    # ELRS ^^^
 
     parser.add_argument(
         "--baud",
@@ -248,7 +253,7 @@ def main(argv=None, esp=None):
                 "15m",
                 "12m",
             ],
-            default=os.environ.get("ESPTOOL_FF", "keep" if allow_keep else None),
+            default=os.environ.get("ESPTOOL_FF", "keep" if allow_keep else "40m"),
         )
         parent.add_argument(
             "--flash_mode",
@@ -331,7 +336,7 @@ def main(argv=None, esp=None):
     )
     parser_write_flash.add_argument(
         "--force",
-        help="Force write, skip security and compatibility checks. Use with caution!",
+        help="Force write even if Secure Boot is enabled. Use with caution!",
         action="store_true",
     )
 
@@ -354,7 +359,7 @@ def main(argv=None, esp=None):
     subparsers.add_parser("run", help="Run application code in flash")
 
     parser_image_info = subparsers.add_parser(
-        "image_info", help="Dump headers from a binary file (bootloader or application)"
+        "image_info", help="Dump headers from an application image"
     )
     parser_image_info.add_argument("filename", help="Image file to parse")
     parser_image_info.add_argument(
@@ -406,31 +411,13 @@ def main(argv=None, esp=None):
         default="1",
     )
     parser_elf2image.add_argument(
-        # it kept for compatibility
-        # Minimum chip revision (deprecated, consider using --min-rev-full)
         "--min-rev",
         "-r",
-        help=argparse.SUPPRESS,
+        help="Minimum chip revision",
         type=int,
         choices=range(256),
         metavar="{0, ... 255}",
         default=0,
-    )
-    parser_elf2image.add_argument(
-        "--min-rev-full",
-        help="Minimal chip revision (in format: major * 100 + minor)",
-        type=int,
-        choices=range(65536),
-        metavar="{0, ... 65535}",
-        default=0,
-    )
-    parser_elf2image.add_argument(
-        "--max-rev-full",
-        help="Maximal chip revision (in format: major * 100 + minor)",
-        type=int,
-        choices=range(65536),
-        metavar="{0, ... 65535}",
-        default=65535,
     )
     parser_elf2image.add_argument(
         "--secure-pad",
@@ -468,13 +455,7 @@ def main(argv=None, esp=None):
     parser_elf2image.add_argument(
         "--flash-mmu-page-size",
         help="Change flash MMU page size.",
-        choices=["64KB", "32KB", "16KB", "8KB"],
-    )
-    parser_elf2image.add_argument(
-        "--pad-to-size",
-        help="The block size with which the final binary image after padding "
-        "must be aligned to. Value 0xFF is used for padding, similar to erase_flash",
-        default=None,
+        choices=["64KB", "32KB", "16KB"],
     )
 
     add_spi_flash_subparsers(parser_elf2image, allow_keep=False, auto_detect=False)
@@ -630,8 +611,6 @@ def main(argv=None, esp=None):
 
     args = parser.parse_args(argv)
     print("esptool.py v%s" % __version__)
-    load_config_file(verbose=True)
-
     # operation function can take 1 arg (args), 2 args (esp, arg)
     # or be a member function of the ESPLoader class.
 
@@ -655,11 +634,11 @@ def main(argv=None, esp=None):
 
     operation_func = globals()[args.operation]
     operation_args = inspect.getfullargspec(operation_func).args
-
     if (
         operation_args[0] == "esp"
     ):  # operation function takes an ESPLoader connection object
-        if args.before != "no_reset_no_sync":
+        # if args.before != "no_reset_no_sync":
+        if args.before != "no_reset_no_sync" and not args.passthrough: # ELRS added passthrough
             initial_baud = min(
                 ESPLoader.ESP_ROM_BAUD, args.baud
             )  # don't sync faster than the default baud rate
@@ -680,7 +659,6 @@ def main(argv=None, esp=None):
             trace=args.trace,
             before=args.before,
         )
-
         if esp is None:
             raise FatalError(
                 "Could not connect to an Espressif device "
@@ -690,9 +668,17 @@ def main(argv=None, esp=None):
         if esp.secure_download_mode:
             print("Chip is %s in Secure Download Mode" % esp.CHIP_NAME)
         else:
-            print("Chip is %s" % (esp.get_chip_description()))
-            print("Features: %s" % ", ".join(esp.get_chip_features()))
-            print("Crystal is %dMHz" % esp.get_crystal_freq())
+            esp : ESP8266ROM
+            print(f"Chip name: {esp.CHIP_NAME}")
+            print(f"Port: {esp._port.port}")
+            _id_ = esp.chip_id()
+            print(f"Chip id {_id_}")
+            _desc_ = esp.get_chip_description()
+            print(f"Chip is {_desc_}")
+            _feats_ = esp.get_chip_features()
+            print(f"Features: {_feats_}")
+            _freq_ = esp.get_crystal_freq()
+            print(f"Crystal is {_freq_}MHz")
             read_mac(esp, args)
 
         if not args.no_stub:
@@ -709,7 +695,16 @@ def main(argv=None, esp=None):
                 )
                 args.no_stub = True
             else:
+                # ELRS vvv when doing passthrough we can only handle small packets
+                if args.passthrough:
+                    esp.ESP_RAM_BLOCK = 0x0800
+                # ELRS ^^^
                 esp = esp.run_stub()
+
+        # ELRS vvv when doing passthrough we can only handle small packets
+        if args.passthrough:
+            esp.FLASH_WRITE_SIZE = 0x0800
+        # ELRS ^^^
 
         if args.override_vddsdio:
             esp.override_vddsdio(args.override_vddsdio)
@@ -799,29 +794,25 @@ def main(argv=None, esp=None):
                         "Try checking the chip connections or removing "
                         "any other hardware connected to IOs."
                     )
-            except FatalError as e:
-                raise FatalError(f"Unable to verify flash chip connection ({e}).")
+            except Exception as e:
+                esp.trace("Unable to verify flash chip connection ({}).".format(e))
 
         # Check if XMC SPI flash chip booted-up successfully, fix if not
         if not esp.secure_download_mode:
             try:
                 flash_xmc_startup()
-            except FatalError as e:
-                esp.trace(f"Unable to perform XMC flash chip startup sequence ({e}).")
+            except Exception as e:
+                esp.trace(
+                    "Unable to perform XMC flash chip startup sequence ({}).".format(e)
+                )
 
         if hasattr(args, "flash_size"):
             print("Configuring flash size...")
-            if args.flash_size == "detect":
-                flash_size = detect_flash_size(esp, args)
-            elif args.flash_size == "keep":
-                flash_size = detect_flash_size(esp, args=None)
-            else:
-                flash_size = args.flash_size
-
-            if flash_size is not None:  # Secure download mode
-                esp.flash_set_parameters(flash_size_bytes(flash_size))
+            detect_flash_size(esp, args)
+            if args.flash_size != "keep":  # TODO: should set this even with 'keep'
+                esp.flash_set_parameters(flash_size_bytes(args.flash_size))
                 # Check if stub supports chosen flash size
-                if esp.IS_STUB and flash_size in ("32MB", "64MB", "128MB"):
+                if esp.IS_STUB and args.flash_size in ("32MB", "64MB", "128MB"):
                     print(
                         "WARNING: Flasher stub doesn't fully support flash size larger "
                         "than 16MB, in case of failure use --no-stub."
@@ -930,8 +921,6 @@ def get_default_connected_device(
             if port is not None:
                 raise
             print("%s failed to connect: %s" % (each_port, err))
-            if _esp and _esp._port:
-                _esp._port.close()
             _esp = None
     return _esp
 
@@ -1037,23 +1026,7 @@ def _main():
     try:
         main()
     except FatalError as e:
-        print(f"\nA fatal error occurred: {e}")
-        sys.exit(2)
-    except serial.serialutil.SerialException as e:
-        print(f"\nA serial exception error occurred: {e}")
-        print(
-            "Note: This error originates from pySerial. "
-            "It is likely not a problem with esptool, "
-            "but with the hardware connection or drivers."
-        )
-        print(
-            "For troubleshooting steps visit: "
-            "https://docs.espressif.com/projects/esptool/en/latest/troubleshooting.html"
-        )
-        sys.exit(1)
-    except StopIteration:
-        print(traceback.format_exc())
-        print("A fatal error occurred: The chip stopped responding.")
+        print("\nA fatal error occurred: %s" % e)
         sys.exit(2)
 
 

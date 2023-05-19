@@ -13,6 +13,15 @@ import zlib
 
 from .bin_image import ELFFile, ImageSegment, LoadFirmwareImage
 from .bin_image import (
+    ESP32C2FirmwareImage,
+    ESP32C3FirmwareImage,
+    ESP32C6BETAFirmwareImage,
+    ESP32FirmwareImage,
+    ESP32H2BETA1FirmwareImage,
+    ESP32H2BETA2FirmwareImage,
+    ESP32S2FirmwareImage,
+    ESP32S3BETA2FirmwareImage,
+    ESP32S3FirmwareImage,
     ESP8266ROMFirmwareImage,
     ESP8266V2FirmwareImage,
     ESP8266V3FirmwareImage,
@@ -34,7 +43,6 @@ from .util import (
 from .util import (
     div_roundup,
     flash_size_bytes,
-    get_file_size,
     hexify,
     pad_to,
     print_overwrite,
@@ -50,20 +58,7 @@ DETECTED_FLASH_SIZES = {
     0x18: "16MB",
     0x19: "32MB",
     0x1A: "64MB",
-    0x1B: "128MB",
-    0x1C: "256MB",
-    0x20: "64MB",
     0x21: "128MB",
-    0x22: "256MB",
-    0x32: "256KB",
-    0x33: "512KB",
-    0x34: "1MB",
-    0x35: "2MB",
-    0x36: "4MB",
-    0x37: "8MB",
-    0x38: "16MB",
-    0x39: "32MB",
-    0x3A: "64MB",
 }
 
 FLASH_MODES = {"qio": 0, "qout": 1, "dio": 2, "dout": 3}
@@ -94,23 +89,24 @@ def detect_chip(
     detect_port.connect(connect_mode, connect_attempts, detecting=True)
     try:
         print("Detecting chip type...", end="")
-        chip_id = detect_port.get_chip_id()
-        for cls in [
-            n for n in ROM_LIST if n.CHIP_NAME not in ("ESP8266", "ESP32", "ESP32S2")
-        ]:
+        res = detect_port.check_command(
+            "get security info", ESPLoader.ESP_GET_SECURITY_INFO, b""
+        )
+        # 4b flags, 1b flash_crypt_cnt, 7*1b key_purposes, 4b chip_id
+        res = struct.unpack("<IBBBBBBBBI", res[:16])
+        chip_id = res[9]  # 2/4 status bytes invariant
+
+        for cls in ROM_LIST[3:]:
             # cmd not supported on ESP8266 and ESP32 + ESP32-S2 doesn't return chip_id
             if chip_id == cls.IMAGE_CHIP_ID:
                 inst = cls(detect_port._port, baud, trace_enabled=trace_enabled)
+                inst._post_connect()
                 try:
                     inst.read_reg(
                         ESPLoader.CHIP_DETECT_MAGIC_REG_ADDR
                     )  # Dummy read to check Secure Download mode
                 except UnsupportedCommandError:
                     inst.secure_download_mode = True
-                inst._post_connect()
-                break
-        else:
-            err_msg = f"Unexpected chip ID value {chip_id}."
     except (UnsupportedCommandError, struct.error, FatalError) as e:
         # UnsupportedCommmanddError: ESP8266/ESP32 ROM
         # struct.error: ESP32-S2
@@ -134,9 +130,6 @@ def detect_chip(
                     inst = cls(detect_port._port, baud, trace_enabled=trace_enabled)
                     inst._post_connect()
                     inst.check_chip_id()
-                    break
-            else:
-                err_msg = f"Unexpected chip magic value {chip_magic_value:#010x}."
         except UnsupportedCommandError:
             raise FatalError(
                 "Unsupported Command Error received. "
@@ -152,8 +145,8 @@ def detect_chip(
             print("")  # end line
             return inst
     raise FatalError(
-        f"{err_msg} Failed to autodetect chip type."
-        "\nProbably it is unsupported by this version of esptool."
+        "Unexpected CHIP magic value 0x%08x. Failed to autodetect chip type."
+        % (chip_magic_value)
     )
 
 
@@ -209,30 +202,24 @@ def dump_mem(esp, args):
     print("Done!")
 
 
-def detect_flash_size(esp, args=None):
-    # TODO: Remove the dependency on args in the next major release (v5.0)
-    if esp.secure_download_mode:
-        if args is not None and args.flash_size == "detect":
+def detect_flash_size(esp, args):
+    if args.flash_size == "detect":
+        if esp.secure_download_mode:
             raise FatalError(
                 "Detecting flash size is not supported in secure download mode. "
                 "Need to manually specify flash size."
             )
-        else:
-            return None
-    flash_id = esp.flash_id()
-    size_id = flash_id >> 16
-    flash_size = DETECTED_FLASH_SIZES.get(size_id)
-    if args is not None and args.flash_size == "detect":
-        if flash_size is None:
-            flash_size = "4MB"
+        flash_id = esp.flash_id()
+        size_id = flash_id >> 16
+        args.flash_size = DETECTED_FLASH_SIZES.get(size_id)
+        if args.flash_size is None:
             print(
-                "Warning: Could not auto-detect Flash size "
-                f"(FlashID={flash_id:#x}, SizeID={size_id:#x}), defaulting to 4MB"
+                "Warning: Could not auto-detect Flash size (FlashID=0x%x, SizeID=0x%x),"
+                " defaulting to 4MB" % (flash_id, size_id)
             )
+            args.flash_size = "4MB"
         else:
-            print("Auto-detected Flash size:", flash_size)
-        args.flash_size = flash_size
-    return flash_size
+            print("Auto-detected Flash size:", args.flash_size)
 
 
 def _update_image_flash_params(esp, address, args, image):
@@ -323,75 +310,24 @@ def write_flash(esp, args):
     # set args.compress based on default behaviour:
     # -> if either --compress or --no-compress is set, honour that
     # -> otherwise, set --compress unless --no-stub is set
+    print("Writing using modified esptool.py!")
     if args.compress is None and not args.no_compress:
         args.compress = not args.no_stub
 
-    if not args.force and esp.CHIP_NAME != "ESP8266" and not esp.secure_download_mode:
-        # Check if secure boot is active
-        if esp.get_secure_boot_enabled():
-            for address, _ in args.addr_filename:
-                if address < 0x8000:
-                    raise FatalError(
-                        "Secure Boot detected, writing to flash regions < 0x8000 "
-                        "is disabled to protect the bootloader. "
-                        "Use --force to override, "
-                        "please use with caution, otherwise it may brick your device!"
-                    )
-        # Check if chip_id and min_rev in image are valid for the target in use
-        for _, argfile in args.addr_filename:
-            try:
-                image = LoadFirmwareImage(esp.CHIP_NAME, argfile)
-            except (FatalError, struct.error, RuntimeError):
-                continue
-            finally:
-                argfile.seek(0)  # LoadFirmwareImage changes the file handle position
-            if image.chip_id != esp.IMAGE_CHIP_ID:
+    if (
+        not args.force
+        and esp.CHIP_NAME != "ESP8266"
+        and not esp.secure_download_mode
+        and esp.get_secure_boot_enabled()
+    ):
+        for address, _ in args.addr_filename:
+            if address < 0x8000:
                 raise FatalError(
-                    f"{argfile.name} is not an {esp.CHIP_NAME} image. "
-                    "Use --force to flash anyway."
+                    "Secure Boot detected, writing to flash regions < 0x8000 "
+                    "is disabled to protect the bootloader. "
+                    "Use --force to override, "
+                    "please use with caution, otherwise it may brick your device!"
                 )
-
-            # this logic below decides which min_rev to use, min_rev or min/max_rev_full
-            if image.max_rev_full == 0:  # image does not have max/min_rev_full fields
-                use_rev_full_fields = False
-            elif image.max_rev_full == 65535:  # image has default value of max_rev_full
-                use_rev_full_fields = True
-                if (
-                    image.min_rev_full == 0 and image.min_rev != 0
-                ):  # min_rev_full is not set, min_rev is used
-                    use_rev_full_fields = False
-            else:  # max_rev_full set to a version
-                use_rev_full_fields = True
-
-            if use_rev_full_fields:
-                rev = esp.get_chip_revision()
-                if rev < image.min_rev_full or rev > image.max_rev_full:
-                    error_str = f"{argfile.name} requires chip revision in range "
-                    error_str += (
-                        f"[v{image.min_rev_full // 100}.{image.min_rev_full % 100} - "
-                    )
-                    if image.max_rev_full == 65535:
-                        error_str += "max rev not set] "
-                    else:
-                        error_str += (
-                            f"v{image.max_rev_full // 100}.{image.max_rev_full % 100}] "
-                        )
-                    error_str += f"(this chip is revision v{rev // 100}.{rev % 100})"
-                    raise FatalError(f"{error_str}. Use --force to flash anyway.")
-            else:
-                # In IDF, image.min_rev is set based on Kconfig option.
-                # For C3 chip, image.min_rev is the Minor revision
-                # while for the rest chips it is the Major revision.
-                if esp.CHIP_NAME == "ESP32-C3":
-                    rev = esp.get_minor_chip_version()
-                else:
-                    rev = esp.get_major_chip_version()
-                if rev < image.min_rev:
-                    raise FatalError(
-                        f"{argfile.name} requires chip revision "
-                        f"{image.min_rev} or higher (this chip is revision {rev}). "
-                        "Use --force to flash anyway."
-                    )
 
     # In case we have encrypted files to write,
     # we first do few sanity checks before actual flash
@@ -435,38 +371,10 @@ def write_flash(esp, args):
                 "Can't perform encrypted flash write, "
                 "consult Flash Encryption documentation for more information"
             )
-    else:
-        if not args.force and esp.CHIP_NAME != "ESP8266":
-            # ESP32 does not support `get_security_info()` and `secure_download_mode`
-            if (
-                esp.CHIP_NAME != "ESP32"
-                and esp.secure_download_mode
-                and bin(esp.get_security_info()["flash_crypt_cnt"]).count("1") & 1 != 0
-            ):
-                raise FatalError(
-                    "WARNING: Detected flash encryption and "
-                    "secure download mode enabled.\n"
-                    "Flashing plaintext binary may brick your device! "
-                    "Use --force to override the warning."
-                )
-
-            if (
-                not esp.secure_download_mode
-                and esp.get_encrypted_download_disabled()
-                and esp.get_flash_encryption_enabled()
-            ):
-                raise FatalError(
-                    "WARNING: Detected flash encryption enabled and "
-                    "download manual encrypt disabled.\n"
-                    "Flashing plaintext binary may brick your device! "
-                    "Use --force to override the warning."
-                )
 
     # verify file sizes fit in flash
-    flash_end = flash_size_bytes(
-        detect_flash_size(esp) if args.flash_size == "keep" else args.flash_size
-    )
-    if flash_end is not None:  # Secure download mode
+    if args.flash_size != "keep":  # TODO: check this even with 'keep'
+        flash_end = flash_size_bytes(args.flash_size)
         for address, argfile in args.addr_filename:
             argfile.seek(0, os.SEEK_END)
             if address + argfile.tell() > flash_end:
@@ -693,7 +601,6 @@ def image_info(args):
                     return key
             return None
 
-        print()
         title = "{} image header".format(args.chip.upper())
         print(title)
         print("=" * len(title))
@@ -738,10 +645,7 @@ def image_info(args):
             title = "{} extended image header".format(args.chip.upper())
             print(title)
             print("=" * len(title))
-            print(
-                f"WP pin: {image.wp_pin:#02x}",
-                *["(disabled)"] if image.wp_pin == image.WP_PIN_DISABLED else [],
-            )
+            print("WP pin: {:#02x}".format(image.wp_pin))
             print(
                 "Flash pins drive settings: "
                 "clk_drv: {:#02x}, q_drv: {:#02x}, d_drv: {:#02x}, "
@@ -754,24 +658,8 @@ def image_info(args):
                     image.wp_drv,
                 )
             )
-            try:
-                chip = next(
-                    chip
-                    for chip in CHIP_DEFS.values()
-                    if getattr(chip, "IMAGE_CHIP_ID", None) == image.chip_id
-                )
-                print(f"Chip ID: {image.chip_id} ({chip.CHIP_NAME})")
-            except StopIteration:
-                print(f"Chip ID: {image.chip_id} (Unknown ID)")
-            print(
-                "Minimal chip revision: "
-                f"v{image.min_rev_full // 100}.{image.min_rev_full % 100}, "
-                f"(legacy min_rev = {image.min_rev})"
-            )
-            print(
-                "Maximal chip revision: "
-                f"v{image.max_rev_full // 100}.{image.max_rev_full % 100}"
-            )
+            print("Chip ID: {}".format(image.chip_id))
+            print("Minimal chip revision: {}".format(image.min_rev))
         print()
 
         # Segments overview
@@ -788,24 +676,16 @@ def image_info(args):
             "{}  {}  {}  {}  {}".format("-" * 7, "-" * 7, "-" * 10, "-" * 10, "-" * 12)
         )
         format_str = "{:7}  {:#07x}  {:#010x}  {:#010x}  {}"
-        app_desc = None
-        bootloader_desc = None
         for idx, seg in enumerate(image.segments, start=1):
             segs = seg.get_memory_type(image)
             seg_name = ", ".join(segs)
-            if "DROM" in segs:  # The DROM segment starts with the esp_app_desc_t struct
-                app_desc = seg.data[:256]
-            elif "DRAM" in segs:
-                # The DRAM segment starts with the esp_bootloader_desc_t struct
-                if len(seg.data) >= 80:
-                    bootloader_desc = seg.data[:80]
             print(
                 format_str.format(idx, len(seg.data), seg.addr, seg.file_offs, seg_name)
             )
         print()
 
         # Footer
-        title = f"{args.chip.upper()} image footer"
+        title = "Image footer"
         print(title)
         print("=" * len(title))
         calc_checksum = image.calculate_checksum()
@@ -822,97 +702,16 @@ def image_info(args):
             if image.append_digest:
                 is_valid = image.stored_digest == image.calc_digest
                 digest_msg = "{} ({})".format(
-                    hexify(image.calc_digest, uppercase=False),
+                    hexify(image.calc_digest).lower(),
                     "valid" if is_valid else "invalid",
                 )
                 print("Validation hash: {}".format(digest_msg))
         except AttributeError:
             pass  # ESP8266 image has no append_digest field
 
-        if app_desc:
-            APP_DESC_STRUCT_FMT = "<II" + "8s" + "32s32s16s16s32s32s" + "80s"
-            (
-                magic_word,
-                secure_version,
-                reserv1,
-                version,
-                project_name,
-                time,
-                date,
-                idf_ver,
-                app_elf_sha256,
-                reserv2,
-            ) = struct.unpack(APP_DESC_STRUCT_FMT, app_desc)
-
-            if magic_word == 0xABCD5432:
-                print()
-                title = "Application information"
-                print(title)
-                print("=" * len(title))
-                print(f'Project name: {project_name.decode("utf-8")}')
-                print(f'App version: {version.decode("utf-8")}')
-                print(f'Compile time: {date.decode("utf-8")} {time.decode("utf-8")}')
-                print(f"ELF file SHA256: {hexify(app_elf_sha256, uppercase=False)}")
-                print(f'ESP-IDF: {idf_ver.decode("utf-8")}')
-                print(f"Secure version: {secure_version}")
-
-        elif bootloader_desc:
-            BOOTLOADER_DESC_STRUCT_FMT = "<B" + "3s" + "I32s24s" + "16s"
-            (
-                magic_byte,
-                reserved,
-                version,
-                idf_ver,
-                date_time,
-                reserved2,
-            ) = struct.unpack(BOOTLOADER_DESC_STRUCT_FMT, bootloader_desc)
-
-            if magic_byte == 80:
-                print()
-                title = "Bootloader information"
-                print(title)
-                print("=" * len(title))
-                print(f"Bootloader version: {version}")
-                print(f'ESP-IDF: {idf_ver.decode("utf-8")}')
-                print(f'Compile time: {date_time.decode("utf-8")}')
-
-    print(f"File size: {get_file_size(args.filename)} (bytes)")
-    with open(args.filename, "rb") as f:
-        # magic number
-        try:
-            common_header = f.read(8)
-            magic = common_header[0]
-        except IndexError:
-            raise FatalError("File is empty")
-        if magic not in [
-            ESPLoader.ESP_IMAGE_MAGIC,
-            ESP8266V2FirmwareImage.IMAGE_V2_MAGIC,
-        ]:
-            raise FatalError(
-                "This is not a valid image "
-                "(invalid magic number: {:#x})".format(magic)
-            )
-
-        if args.chip == "auto":
-            try:
-                extended_header = f.read(16)
-
-                # append_digest, either 0 or 1
-                if extended_header[-1] not in [0, 1]:
-                    raise FatalError("Append digest field not 0 or 1")
-
-                chip_id = int.from_bytes(extended_header[4:5], "little")
-                for rom in [n for n in ROM_LIST if n.CHIP_NAME != "ESP8266"]:
-                    if chip_id == rom.IMAGE_CHIP_ID:
-                        args.chip = rom.CHIP_NAME
-                        break
-                else:
-                    raise FatalError(f"Unknown image chip ID ({chip_id})")
-            except FatalError:
-                args.chip = "esp8266"
-
-            print(f"Detected image type: {args.chip.upper()}")
-
+    if args.chip == "auto":
+        print("WARNING: --chip not specified, defaulting to ESP8266.")
+        args.chip = "esp8266"
     image = LoadFirmwareImage(args.chip, args.filename)
 
     if args.version == "2":
@@ -947,7 +746,7 @@ def image_info(args):
         if image.append_digest:
             is_valid = image.stored_digest == image.calc_digest
             digest_msg = "{} ({})".format(
-                hexify(image.calc_digest, uppercase=False),
+                hexify(image.calc_digest).lower(),
                 "valid" if is_valid else "invalid",
             )
             print("Validation Hash: {}".format(digest_msg))
@@ -956,7 +755,6 @@ def image_info(args):
 
 
 def make_image(args):
-    print("Creating {} image...".format(args.chip))
     image = ESP8266ROMFirmwareImage()
     if len(args.segfile) == 0:
         raise FatalError("No segments specified")
@@ -964,13 +762,12 @@ def make_image(args):
         raise FatalError(
             "Number of specified files does not match number of specified addresses"
         )
-    for seg, addr in zip(args.segfile, args.segaddr):
+    for (seg, addr) in zip(args.segfile, args.segaddr):
         with open(seg, "rb") as f:
             data = f.read()
             image.segments.append(ImageSegment(addr, data))
     image.entrypoint = args.entrypoint
     image.save(args.output)
-    print("Successfully created {} image.".format(args.chip))
 
 
 def elf2image(args):
@@ -980,16 +777,44 @@ def elf2image(args):
 
     print("Creating {} image...".format(args.chip))
 
-    if args.chip != "esp8266":
-        image = CHIP_DEFS[args.chip].BOOTLOADER_IMAGE()
-        if args.chip == "esp32" and args.secure_pad:
+    if args.chip == "esp32":
+        image = ESP32FirmwareImage()
+        if args.secure_pad:
             image.secure_pad = "1"
+        elif args.secure_pad_v2:
+            image.secure_pad = "2"
+    elif args.chip == "esp32s2":
+        image = ESP32S2FirmwareImage()
         if args.secure_pad_v2:
             image.secure_pad = "2"
-        image.min_rev = args.min_rev
-        image.min_rev_full = args.min_rev_full
-        image.max_rev_full = args.max_rev_full
-        image.append_digest = args.append_digest
+    elif args.chip == "esp32s3beta2":
+        image = ESP32S3BETA2FirmwareImage()
+        if args.secure_pad_v2:
+            image.secure_pad = "2"
+    elif args.chip == "esp32s3":
+        image = ESP32S3FirmwareImage()
+        if args.secure_pad_v2:
+            image.secure_pad = "2"
+    elif args.chip == "esp32c3":
+        image = ESP32C3FirmwareImage()
+        if args.secure_pad_v2:
+            image.secure_pad = "2"
+    elif args.chip == "esp32c6beta":
+        image = ESP32C6BETAFirmwareImage()
+        if args.secure_pad_v2:
+            image.secure_pad = "2"
+    elif args.chip == "esp32h2beta1":
+        image = ESP32H2BETA1FirmwareImage()
+        if args.secure_pad_v2:
+            image.secure_pad = "2"
+    elif args.chip == "esp32h2beta2":
+        image = ESP32H2BETA2FirmwareImage()
+        if args.secure_pad_v2:
+            image.secure_pad = "2"
+    elif args.chip == "esp32c2":
+        image = ESP32C2FirmwareImage()
+        if args.secure_pad_v2:
+            image.secure_pad = "2"
     elif args.version == "1":  # ESP8266
         image = ESP8266ROMFirmwareImage()
     elif args.version == "2":
@@ -999,13 +824,16 @@ def elf2image(args):
     image.entrypoint = e.entrypoint
     image.flash_mode = FLASH_MODES[args.flash_mode]
 
+    if args.chip != "esp8266":
+        image.min_rev = args.min_rev
+        image.append_digest = args.append_digest
+
     if args.flash_mmu_page_size:
         image.set_mmu_page_size(flash_size_bytes(args.flash_mmu_page_size))
 
     # ELFSection is a subclass of ImageSegment, so can use interchangeably
     image.segments = e.segments if args.use_segments else e.sections
-    if args.pad_to_size:
-        image.pad_to_size = flash_size_bytes(args.pad_to_size)
+
     image.flash_size_freq = image.ROM_LOADER.parse_flash_size_arg(args.flash_size)
     image.flash_size_freq += image.ROM_LOADER.parse_flash_freq_arg(args.flash_freq)
 
@@ -1088,11 +916,6 @@ def flash_id(esp, args):
     print(
         "Detected flash size: %s" % (DETECTED_FLASH_SIZES.get(flid_lowbyte, "Unknown"))
     )
-    flash_type = esp.flash_type()
-    flash_type_dict = {0: "quad (4 data lines)", 1: "octal (8 data lines)"}
-    flash_type_str = flash_type_dict.get(flash_type)
-    if flash_type_str:
-        print(f"Flash type set in eFuse: {flash_type_str}")
 
 
 def read_flash(esp, args):
@@ -1178,7 +1001,7 @@ def write_flash_status(esp, args):
 
 def get_security_info(esp, args):
     si = esp.get_security_info()
-    # TODO: better display
+    # TODO: better display and tests
     print("Flags: {:#010x} ({})".format(si["flags"], bin(si["flags"])))
     print("Flash_Crypt_Cnt: {:#x}".format(si["flash_crypt_cnt"]))
     print("Key_Purposes: {}".format(si["key_purposes"]))
