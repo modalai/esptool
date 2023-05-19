@@ -668,17 +668,13 @@ def main(argv=None, esp=None):
         if esp.secure_download_mode:
             print("Chip is %s in Secure Download Mode" % esp.CHIP_NAME)
         else:
-            esp : ESP8266ROM
+            # esp : ESP8266ROM
             print(f"Chip name: {esp.CHIP_NAME}")
             print(f"Port: {esp._port.port}")
-            _id_ = esp.chip_id()
-            print(f"Chip id {_id_}")
-            _desc_ = esp.get_chip_description()
-            print(f"Chip is {_desc_}")
-            _feats_ = esp.get_chip_features()
-            print(f"Features: {_feats_}")
-            _freq_ = esp.get_crystal_freq()
-            print(f"Crystal is {_freq_}MHz")
+            # print(f"Chip id {hex(esp.chip_id())}")
+            print(f"Chip is {esp.get_chip_description()}")
+            print(f"Features: {esp.get_chip_features()}")
+            print(f"Crystal is {esp.get_crystal_freq()}MHz")
             read_mac(esp, args)
 
         if not args.no_stub:

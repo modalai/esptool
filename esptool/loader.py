@@ -73,6 +73,7 @@ ERASE_WRITE_TIMEOUT_PER_MB = 40  # timeout (per megabyte) for erasing and writin
 MEM_END_ROM_TIMEOUT = 0.05  # short timeout for ESP_MEM_END, as it may never respond
 DEFAULT_SERIAL_WRITE_TIMEOUT = 10  # timeout for serial port write
 DEFAULT_CONNECT_ATTEMPTS = 7  # default number of times to try connection
+current_op = None   # Current operation used for quicker connecting 
 
 STUBS_DIR = os.path.join(os.path.dirname(__file__), "./targets/stub_flasher/")
 
@@ -357,6 +358,8 @@ class ESPLoader(object):
         timeout=DEFAULT_TIMEOUT,
     ):
         """Send a request and read the response"""
+        global current_op 
+        current_op = op
         saved_timeout = self._port.timeout
         new_timeout = min(timeout, MAX_TIMEOUT)
         if new_timeout != saved_timeout:
@@ -1432,13 +1435,27 @@ def slip_reader(port, trace_function):
             time.sleep(1/port.baudrate)
             if wait_count < 150000: 
                 wait_count += 1
+                
+                # Case for TX flashing
+                if port.port == "/dev/ttyUSB0":
+                    if wait_count > 100 and current_op == ESPLoader.ESP_SYNC:
+                        # We raise an error here to start another connection attempt sequence instead of waiting 
+                        # for this current one to timeout, we don't catch errors in main though so this essentially 
+                        # does nothing but allow us to exit this function without causing the program to crash
+                        raise FatalError("Waiting for SYNC")
+                    
+                # Case for RX flashing through SLPI (J19 on voxl2)
+                elif port.port == "/dev/slpi-uart-7":
+                    if wait_count > 1000 and current_op == ESPLoader.ESP_SYNC:
+                        raise FatalError("Waiting for SYNC")
+                
                 continue
             else:
                 if partial_packet is None:  # fail due to no data
                     msg = (
                         f"Serial data stream stopped: Possible serial noise or corruption.\tWait count: {wait_count}\nPartial Packet:{partial_packet}\nWaiting:{waiting}"
                         if successful_slip
-                        else f"No serial data received. Wait count: {wait_count}"
+                        else f"No serial data received. Wait count: {wait_count}. Current OP: {current_op}"
                     )
                 else:  # fail during packet transfer
                     msg = "Packet content transfer stopped (received {} bytes)".format(
