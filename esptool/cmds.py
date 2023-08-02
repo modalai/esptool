@@ -310,7 +310,6 @@ def write_flash(esp, args):
     # set args.compress based on default behaviour:
     # -> if either --compress or --no-compress is set, honour that
     # -> otherwise, set --compress unless --no-stub is set
-    print("Writing using modified esptool.py!")
     if args.compress is None and not args.no_compress:
         args.compress = not args.no_stub
 
