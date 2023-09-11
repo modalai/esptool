@@ -480,11 +480,10 @@ def write_flash(esp, args):
         timeout = DEFAULT_TIMEOUT
 
         while len(image) > 0:
-            print_overwrite(
+            print(
                 "Writing at 0x%08x... (%d %%)"
                 % (address + bytes_written, 100 * (seq + 1) // blocks)
             )
-            sys.stdout.flush()
             block = image[0 : esp.FLASH_WRITE_SIZE]
             if compress:
                 # feeding each compressed block into the decompressor lets us
@@ -527,10 +526,9 @@ def write_flash(esp, args):
         if compress:
             if t > 0.0:
                 speed_msg = " (effective %.1f kbit/s)" % (uncsize / t * 8 / 1000)
-            print_overwrite(
+            print(
                 "Wrote %d bytes (%d compressed) at 0x%08x in %.1f seconds%s..."
-                % (uncsize, bytes_sent, address, t, speed_msg),
-                last_line=True,
+                % (uncsize, bytes_sent, address, t, speed_msg)
             )
         else:
             if t > 0.0:

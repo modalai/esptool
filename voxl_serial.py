@@ -1,6 +1,7 @@
 import ctypes as ct
 import numpy as np
 import time
+import math 
 
 libvoxl_io = ct.CDLL("libslpi_uart_bridge_cpu.so")
 
@@ -58,10 +59,10 @@ class VoxlSerialPort():
     writeTimeout  = 0
     read_buf_ptr  = None
     read_buf_size = 256
-    write_buf_size = 64
+    write_buf_size = 32
+    name = ""
 
     def __init__(self):
-        print("Initializing voxl_serial port!")
         self.initialized = False
 
     def isOpen(self):
@@ -72,9 +73,8 @@ class VoxlSerialPort():
 
     def open(self):
         self.port_num = int(self.port.split('-')[-1])
-        print(f"Port num: {self.port_num}")
+        self.name = self.port
         self._baudrate = int(self._baudrate)
-        print(f"Baud Rate: {self._baudrate}")
         voxl_uart_init(self.port_num, self._baudrate)
         self.read_buf_ptr = voxl_rpc_shared_mem_alloc(self.read_buf_size)
         self.initialized  = True
@@ -85,13 +85,9 @@ class VoxlSerialPort():
 
     @baudrate.setter
     def baudrate(self,value):
-        # print(f"voxl_serial.py: Setting new baud rate: {self.baudrate}->{value}\tInit: {self.initialized}")
         self._baudrate = value
         if self.initialized:
             ret = voxl_uart_init(self.port_num, self._baudrate)
-            # print(f'Updated baud rate to {self._baudrate}')
-        else:
-            print("Port not initialized voxl_serial.py")
 
     def close(self):
         if not self.initialized:
@@ -109,28 +105,17 @@ class VoxlSerialPort():
     def write(self, data):
         if not self.initialized:
             raise Exception('port is not initialized')
-        
-        # print(f"\tSize of data to be written: {np.array(data).nbytes} bytes")
-        # print(f"\tReceived data: {data}")
         # If data is larger than rx buffer on SLPI side, break into smaller chunks before writing
         if len(data) > self.write_buf_size:
-            # print(f"\tSize of data to be written to large! Breaking into {self.write_buf_size} byte chunks.")
-            blocks = (len(data) + self.write_buf_size - 1) // self.write_buf_size
+            blocks = math.ceil(len(data) / self.write_buf_size)
             for block in range(blocks):
                 from_offs = block * self.write_buf_size
                 to_offs = from_offs + self.write_buf_size
 
                 # Prevent index out of range
                 if to_offs > len(data):
-                    # print(f"\tEnd offset too large: {to_offs}")
-                    # print(f"\tSetting to {len(bytearray(data))}")
-                    # print(f"\tLast byte: {hex(data[np.array(data).nbytes-1])} (should be c0)")
                     to_offs = len(data) + 1
-                
-                # print(f"data:\n{data}")
                 data_slice = np.array(data[from_offs:to_offs])
-                # print(f"\tWriting {len(bytearray(data_slice))} bytes...[{from_offs}:{to_offs-1}]")
-                # print(f"data:\n{data_slice}")
                 data_ptr = data_slice.ctypes.data_as(ct.POINTER(ct.c_uint8))
                 voxl_uart_write(self.port_num,data_ptr,data_slice.nbytes)
         
@@ -140,13 +125,26 @@ class VoxlSerialPort():
             data_ptr = data.ctypes.data_as(ct.POINTER(ct.c_uint8))
             voxl_uart_write(self.port_num,data_ptr,data.nbytes)
 
-        # print(f"\tFinished writing {np.array(data).nbytes} bytes")
-
         # Give some time for SLPI to read and respond after writing
-        time.sleep(0.013)
+        time.sleep(0.005)
 
     def flush(self):
         voxl_uart_flush(self.port_num)
 
+    # The functions below are not implemented in libqrb5165 so we need these fake functions to avoid error messages when flashing BetaFPV Nano RX
     def flushInput(self):
+        self.flush()
+        pass
+
+    def flushOutput(self):
+        self.flush()
+        pass
+
+    def setRTS(self, state):
+        pass
+
+    def setDTR(self, state):
+        pass
+
+    def dtr(self, state):
         pass

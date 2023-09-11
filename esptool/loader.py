@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2014-2022 Fredrik Ahlberg, Angus Gratton,
+# SPDX-FileCopyrightText: 2014-2023 Fredrik Ahlberg, Angus Gratton,
 # Espressif Systems (Shanghai) CO LTD, other contributors as noted.
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
@@ -14,8 +14,17 @@ import struct
 import sys
 import time
 
+from .config import load_config_file
+from .reset import (
+    ClassicReset,
+    CustomReset,
+    DEFAULT_RESET_DELAY,
+    HardReset,
+    USBJTAGSerialReset,
+    UnixTightReset,
+)
 from .util import FatalError, NotImplementedInROMError, UnsupportedCommandError
-from .util import byte, hexify, mask_to_shift, pad_to
+from .util import byte, hexify, mask_to_shift, pad_to, strip_chip_name
 
 try:
     import serial
@@ -62,26 +71,41 @@ except Exception:
         raise
 
 
-DEFAULT_TIMEOUT = 3  # timeout for most flash operations
-START_FLASH_TIMEOUT = 20  # timeout for starting flash (may perform erase)
-CHIP_ERASE_TIMEOUT = 120  # timeout for full chip erase
-MAX_TIMEOUT = CHIP_ERASE_TIMEOUT * 2  # longest any command can run
-SYNC_TIMEOUT = 0.1  # timeout for syncing with bootloader
-MD5_TIMEOUT_PER_MB = 8  # timeout (per megabyte) for calculating md5sum
-ERASE_REGION_TIMEOUT_PER_MB = 30  # timeout (per megabyte) for erasing a region
-ERASE_WRITE_TIMEOUT_PER_MB = 40  # timeout (per megabyte) for erasing and writing data
-MEM_END_ROM_TIMEOUT = 0.05  # short timeout for ESP_MEM_END, as it may never respond
-DEFAULT_SERIAL_WRITE_TIMEOUT = 10  # timeout for serial port write
-DEFAULT_CONNECT_ATTEMPTS = 7  # default number of times to try connection
-current_op = None   # Current operation used for quicker connecting 
+cfg, _ = load_config_file()
+cfg = cfg["esptool"]
 
-STUBS_DIR = os.path.join(os.path.dirname(__file__), "./targets/stub_flasher/")
+# Timeout for most flash operations
+DEFAULT_TIMEOUT = cfg.getfloat("timeout", 3)
+# Timeout for full chip erase
+CHIP_ERASE_TIMEOUT = cfg.getfloat("chip_erase_timeout", 120)
+# Longest any command can run
+MAX_TIMEOUT = cfg.getfloat("max_timeout", CHIP_ERASE_TIMEOUT * 2)
+# Timeout for syncing with bootloader
+SYNC_TIMEOUT = cfg.getfloat("sync_timeout", 0.1)
+# Timeout (per megabyte) for calculating md5sum
+MD5_TIMEOUT_PER_MB = cfg.getfloat("md5_timeout_per_mb", 8)
+# Timeout (per megabyte) for erasing a region
+ERASE_REGION_TIMEOUT_PER_MB = cfg.getfloat("erase_region_timeout_per_mb", 30)
+# Timeout (per megabyte) for erasing and writing data
+ERASE_WRITE_TIMEOUT_PER_MB = cfg.getfloat("erase_write_timeout_per_mb", 40)
+# Short timeout for ESP_MEM_END, as it may never respond
+MEM_END_ROM_TIMEOUT = cfg.getfloat("mem_end_rom_timeout", 0.2)
+# Timeout for serial port write
+DEFAULT_SERIAL_WRITE_TIMEOUT = cfg.getfloat("serial_write_timeout", 10)
+# Default number of times to try connection
+DEFAULT_CONNECT_ATTEMPTS = cfg.getint("connect_attempts", 7)
+# Number of times to try writing a data block
+WRITE_BLOCK_ATTEMPTS = cfg.getint("write_block_attempts", 3)
+# Current operation used for quicker connecting 
+current_op = None   
+
+STUBS_DIR = os.path.join(os.path.dirname(__file__), "targets", "stub_flasher")
 
 
 def get_stub_json_path(chip_name):
-    chip_name = re.sub(r"[-()]", "", chip_name.lower())
+    chip_name = strip_chip_name(chip_name)
     chip_name = chip_name.replace("esp", "")
-    return STUBS_DIR + "stub_flasher_" + chip_name + ".json"
+    return os.path.join(STUBS_DIR, f"stub_flasher_{chip_name}.json")
 
 
 def timeout_per_mb(seconds_per_mb, size_bytes):
@@ -268,18 +292,26 @@ class ESPLoader(object):
         # True if esptool detects conditions which require the stub to be disabled
         self.stub_is_disabled = False
 
+        # Device-and-runtime-specific cache
+        self.cache = {
+            "flash_id": None,
+            "chip_id": None,
+            "uart_no": None,
+            "usb_pid": None,
+        }
+
         if isinstance(port, str):
             try:
                 if port == "/dev/slpi-uart-7":
-                    import voxl_serial
-                    self._port = voxl_serial.VoxlSerialPort()
-                    self._port.port = "/dev/slpi-uart-7"
                     try:
+                        import voxl_serial
+                        self._port = voxl_serial.VoxlSerialPort()
+                        self._port.port = "/dev/slpi-uart-7"
+                        self._port.baudrate = 115200
                         self._port.open()
                         self._port.flush()
-                        print(f"Opened voxl_serial port!")
-                    except:
-                        raise
+                    except Exception as e:
+                        raise e
                 else:
                     self._port = serial.serial_for_url(port)
             except serial.serialutil.SerialException:
@@ -294,10 +326,8 @@ class ESPLoader(object):
         self._set_port_baudrate(baud)
         self._trace_enabled = trace_enabled
         # set write timeout, to prevent esptool blocked at write forever.
-        print(f"Serial port opened: {self._port.port} @ {self._port.baudrate}")
         try:
             self._port.write_timeout = DEFAULT_SERIAL_WRITE_TIMEOUT
-            self._port.writeTimeout = DEFAULT_SERIAL_WRITE_TIMEOUT
         except NotImplementedError:
             # no write timeout for RFC2217 ports
             # need to set the property back to None or it will continue to fail
@@ -387,8 +417,12 @@ class ESPLoader(object):
             # exceeded. This is needed for some esp8266s that
             # reply with more sync responses than expected.
             for retry in range(100):
+                # print("Waiting for response from receiver...")
                 p = self.read()
                 if len(p) < 8:
+                    if p[0] == 0x01:
+                        self.sync()
+                    self.write(pkt)
                     continue
                 (resp, op_ret, len_ret, val) = struct.unpack("<BBHI", p[:8])
                 if resp != 1:
@@ -460,17 +494,10 @@ class ESPLoader(object):
             val, _ = self.command()
             self.sync_stub_detected &= val == 0
 
-    def _setDTR(self, state):
-        self._port.setDTR(state)
-
-    def _setRTS(self, state):
-        self._port.setRTS(state)
-        # Work-around for adapters on Windows using the usbser.sys driver:
-        # generate a dummy change to DTR so that the set-control-line-state
-        # request is sent with the updated RTS state and the same DTR state
-        self._port.setDTR(self._port.dtr)
-
     def _get_pid(self):
+        if self.cache["usb_pid"] is not None:
+            return self.cache["usb_pid"]
+
         if list_ports is None:
             print(
                 "\nListing all serial ports is currently not available. "
@@ -490,72 +517,23 @@ class ESPLoader(object):
         if active_port.startswith("/dev/") and os.path.islink(active_port):
             active_port = os.path.realpath(active_port)
 
+        active_ports = [active_port]
+
         # The "cu" (call-up) device has to be used for outgoing communication on MacOS
         if sys.platform == "darwin" and "tty" in active_port:
-            active_port = [active_port, active_port.replace("tty", "cu")]
-        return 0 
+            active_ports.append(active_port.replace("tty", "cu"))
+        return 0
         ports = list_ports.comports()
-        print(f"Ports: {ports}")
         for p in ports:
-            print(f"Testing port: {p}")
-            if p.device in active_port:
+            if p.device in active_ports:
+                self.cache["usb_pid"] = p.pid
                 return p.pid
         print(
-            "\nFailed to get PID of a device on {}, "
-            "using standard reset sequence.".format(active_port)
+            f"\nFailed to get PID of a device on {active_port}, "
+            "using standard reset sequence."
         )
 
-    def bootloader_reset(self, usb_jtag_serial=False, extra_delay=False):
-        """
-        Issue a reset-to-bootloader, with USB-JTAG-Serial custom reset sequence option
-        """
-        # RTS = either CH_PD/EN or nRESET (both active low = chip in reset)
-        # DTR = GPIO0 (active low = boot to flasher)
-        #
-        # DTR & RTS are active low signals,
-        # ie True = pin @ 0V, False = pin @ VCC.
-        if usb_jtag_serial:
-            # Custom reset sequence, which is required when the device
-            # is connecting via its USB-JTAG-Serial peripheral
-            self._setRTS(False)
-            self._setDTR(False)  # Idle
-            time.sleep(0.1)
-            self._setDTR(True)  # Set IO0
-            self._setRTS(False)
-            time.sleep(0.1)
-            self._setRTS(
-                True
-            )  # Reset. Note dtr/rts calls inverted to go through (1,1) instead of (0,0)
-            self._setDTR(False)
-            self._setRTS(
-                True
-            )  # Extra RTS set for RTS as Windows only propagates DTR on RTS setting
-            time.sleep(0.1)
-            self._setDTR(False)
-            self._setRTS(False)
-        else:
-            # This fpga delay is for Espressif internal use
-            fpga_delay = (
-                True
-                if self.FPGA_SLOW_BOOT
-                and os.environ.get("ESPTOOL_ENV_FPGA", "").strip() == "1"
-                else False
-            )
-            delay = (
-                7 if fpga_delay else 0.5 if extra_delay else 0.05
-            )  # 0.5 needed for ESP32 rev0 and rev1
-
-            self._setDTR(False)  # IO0=HIGH
-            self._setRTS(True)  # EN=LOW, chip in reset
-            time.sleep(0.1)
-            self._setDTR(True)  # IO0=LOW
-            self._setRTS(False)  # EN=HIGH, chip out of reset
-            time.sleep(delay)
-            self._setDTR(False)  # IO0=HIGH, done
-
-    def _connect_attempt(
-        self, mode="default_reset", usb_jtag_serial=False, extra_delay=False
-    ):
+    def _connect_attempt(self, reset_strategy, mode="default_reset"):
         """A single connection attempt"""
         last_error = None
         boot_log_detected = False
@@ -570,7 +548,8 @@ class ESPLoader(object):
             if not self.USES_RFC2217:  # Might block on rfc2217 ports
                 # Empty serial buffer to isolate boot log
                 self._port.reset_input_buffer()
-            self.bootloader_reset(usb_jtag_serial, extra_delay)
+
+            reset_strategy()  # Reset the chip to bootloader (download mode)
 
             # Detect the ROM boot log and check actual boot mode (ESP32 and later only)
             waiting = self._port.inWaiting()
@@ -586,8 +565,7 @@ class ESPLoader(object):
         for _ in range(5):
             try:
                 self.flush_input()
-                # self._port.flushOutput()
-                self._port.flush()
+                self._port.flushOutput()
                 self.sync()
                 return None
             except FatalError as e:
@@ -620,6 +598,48 @@ class ESPLoader(object):
         except IndexError:
             return None
 
+    def _construct_reset_strategy_sequence(self, mode):
+        """
+        Constructs a sequence of reset strategies based on the OS,
+        used ESP chip, external settings, and environment variables.
+        Returns a tuple of one or more reset strategies to be tried sequentially.
+        """
+        cfg_custom_reset_sequence = cfg.get("custom_reset_sequence")
+        if cfg_custom_reset_sequence is not None:
+            return (CustomReset(self._port, cfg_custom_reset_sequence),)
+
+        cfg_reset_delay = cfg.getfloat("reset_delay")
+        if cfg_reset_delay is not None:
+            delay = extra_delay = cfg_reset_delay
+        else:
+            delay = DEFAULT_RESET_DELAY
+            extra_delay = DEFAULT_RESET_DELAY + 0.5
+
+        # This FPGA delay is for Espressif internal use
+        if (
+            self.FPGA_SLOW_BOOT
+            and os.environ.get("ESPTOOL_ENV_FPGA", "").strip() == "1"
+        ):
+            delay = extra_delay = 7
+
+        # USB-JTAG/Serial mode
+        if mode == "usb_reset" or self._get_pid() == self.USB_JTAG_SERIAL_PID:
+            return (USBJTAGSerialReset(self._port),)
+
+        # USB-to-Serial bridge
+        if os.name != "nt" and not self._port.name.startswith("rfc2217:"):
+            return (
+                UnixTightReset(self._port, delay),
+                UnixTightReset(self._port, extra_delay),
+                ClassicReset(self._port, delay),
+                ClassicReset(self._port, extra_delay),
+            )
+
+        return (
+            ClassicReset(self._port, delay),
+            ClassicReset(self._port, extra_delay),
+        )
+
     def connect(
         self,
         mode="default_reset",
@@ -638,26 +658,20 @@ class ESPLoader(object):
         sys.stdout.flush()
         last_error = None
 
-        usb_jtag_serial = (mode == "usb_reset") or (
-            self._get_pid() == self.USB_JTAG_SERIAL_PID
-        )
-
-        # if not self._port.isOpen():
+        reset_sequence = self._construct_reset_strategy_sequence(mode)
         try:
-                
-            for _, extra_delay in zip(
+            for _, reset_strategy in zip(
                 range(attempts) if attempts > 0 else itertools.count(),
-                itertools.cycle((False, True)),
+                itertools.cycle(reset_sequence),
             ):
-                last_error = self._connect_attempt(
-                    mode=mode, usb_jtag_serial=usb_jtag_serial, extra_delay=extra_delay
-                )
+                last_error = self._connect_attempt(reset_strategy, mode)
                 if last_error is None:
                     break
         finally:
             print("")  # end 'Connecting...' line
 
         if last_error is not None:
+            raise 
             raise FatalError(
                 "Failed to connect to {}: {}"
                 "\nFor troubleshooting steps visit: "
@@ -693,10 +707,17 @@ class ESPLoader(object):
                         )
             except UnsupportedCommandError:
                 self.secure_download_mode = True
+
+            try:
+                self.check_chip_id()
+            except UnsupportedCommandError:
+                # Fix for ROM not responding in SDM, reconnect and try again
+                if self.secure_download_mode:
+                    self._connect_attempt(mode, reset_sequence[0])
+                    self.check_chip_id()
+                else:
+                    raise
             self._post_connect()
-            self.check_chip_id()
-        else:
-            print("Skipping detecting!")
 
     def _post_connect(self):
         """
@@ -752,7 +773,7 @@ class ESPLoader(object):
             stub = StubFlasher(get_stub_json_path(self.CHIP_NAME))
             load_start = offset
             load_end = offset + size
-            for (start, end) in [
+            for start, end in [
                 (stub.data_start, stub.data_start + len(stub.data)),
                 (stub.text_start, stub.text_start + len(stub.text)),
             ]:
@@ -764,6 +785,7 @@ class ESPLoader(object):
                         "option to disable the software loader."
                         % (start, end, load_start, load_end)
                     )
+
         return self.check_command(
             "enter RAM download mode",
             self.ESP_MEM_BEGIN,
@@ -826,29 +848,51 @@ class ESPLoader(object):
         return num_blocks
 
     def flash_block(self, data, seq, timeout=DEFAULT_TIMEOUT):
-        """Write block to flash"""
-        self.check_command(
-            "write to target Flash after seq %d" % seq,
-            self.ESP_FLASH_DATA,
-            struct.pack("<IIII", len(data), seq, 0, 0) + data,
-            self.checksum(data),
-            timeout=timeout,
-        )
+        """Write block to flash, retry if fail"""
+        for attempts_left in range(WRITE_BLOCK_ATTEMPTS - 1, -1, -1):
+            try:
+                self.check_command(
+                    "write to target Flash after seq %d" % seq,
+                    self.ESP_FLASH_DATA,
+                    struct.pack("<IIII", len(data), seq, 0, 0) + data,
+                    self.checksum(data),
+                    timeout=timeout,
+                )
+                break
+            except FatalError:
+                if attempts_left:
+                    self.trace(
+                        "Block write failed, "
+                        f"retrying with {attempts_left} attempts left"
+                    )
+                else:
+                    raise
 
     def flash_encrypt_block(self, data, seq, timeout=DEFAULT_TIMEOUT):
-        """Encrypt before writing to flash"""
+        """Encrypt, write block to flash, retry if fail"""
         if self.SUPPORTS_ENCRYPTED_FLASH and not self.IS_STUB:
             # ROM support performs the encrypted writes via the normal write command,
             # triggered by flash_begin(begin_rom_encrypted=True)
             return self.flash_block(data, seq, timeout)
 
-        self.check_command(
-            "Write encrypted to target Flash after seq %d" % seq,
-            self.ESP_FLASH_ENCRYPT_DATA,
-            struct.pack("<IIII", len(data), seq, 0, 0) + data,
-            self.checksum(data),
-            timeout=timeout,
-        )
+        for attempts_left in range(WRITE_BLOCK_ATTEMPTS - 1, -1, -1):
+            try:
+                self.check_command(
+                    "Write encrypted to target Flash after seq %d" % seq,
+                    self.ESP_FLASH_ENCRYPT_DATA,
+                    struct.pack("<IIII", len(data), seq, 0, 0) + data,
+                    self.checksum(data),
+                    timeout=timeout,
+                )
+                break
+            except FatalError:
+                if attempts_left:
+                    self.trace(
+                        "Encrypted block write failed, "
+                        f"retrying with {attempts_left} attempts left"
+                    )
+                else:
+                    raise
 
     def flash_finish(self, reboot=False):
         """Leave flash mode and run/reboot"""
@@ -864,8 +908,14 @@ class ESPLoader(object):
 
     def flash_id(self):
         """Read SPI flash manufacturer and device id"""
-        SPIFLASH_RDID = 0x9F
-        return self.run_spiflash_command(SPIFLASH_RDID, b"", 24)
+        if self.cache["flash_id"] is None:
+            SPIFLASH_RDID = 0x9F
+            self.cache["flash_id"] = self.run_spiflash_command(SPIFLASH_RDID, b"", 24)
+        return self.cache["flash_id"]
+
+    def flash_type(self):
+        """Read flash type bit field from eFuse. Returns 0, 1, None (not present)"""
+        return None  # not implemented for all chip targets
 
     def get_security_info(self):
         res = self.check_command("get security info", self.ESP_GET_SECURITY_INFO, b"")
@@ -881,12 +931,23 @@ class ESPLoader(object):
 
     @esp32s3_or_newer_function_only
     def get_chip_id(self):
-        res = self.check_command("get security info", self.ESP_GET_SECURITY_INFO, b"")
-        res = struct.unpack(
-            "<IBBBBBBBBI", res[:16]
-        )  # 4b flags, 1b flash_crypt_cnt, 7*1b key_purposes, 4b chip_id
-        chip_id = res[9]  # 2/4 status bytes invariant
-        return chip_id
+        if self.cache["chip_id"] is None:
+            res = self.check_command(
+                "get security info", self.ESP_GET_SECURITY_INFO, b""
+            )
+            res = struct.unpack(
+                "<IBBBBBBBBI", res[:16]
+            )  # 4b flags, 1b flash_crypt_cnt, 7*1b key_purposes, 4b chip_id
+            self.cache["chip_id"] = res[9]  # 2/4 status bytes invariant
+        return self.cache["chip_id"]
+
+    def get_uart_no(self):
+        """
+        Read the UARTDEV_BUF_NO register to get the number of the currently used console
+        """
+        if self.cache["uart_no"] is None:
+            self.cache["uart_no"] = self.read_reg(self.UARTDEV_BUF_NO) & 0xFF
+        return self.cache["uart_no"]
 
     @classmethod
     def parse_flash_size_arg(cls, arg):
@@ -900,6 +961,9 @@ class ESPLoader(object):
 
     @classmethod
     def parse_flash_freq_arg(cls, arg):
+        if arg is None:
+            # The encoding of the default flash frequency in FLASH_FREQUENCY is always 0
+            return 0
         try:
             return cls.FLASH_FREQUENCY[arg]
         except KeyError:
@@ -923,25 +987,25 @@ class ESPLoader(object):
             if field is not None:
                 offs = stub.text_start if field == stub.text else stub.data_start
                 length = len(field)
-                # print(f"\tUsing ESP_RAM_BLOCK size of {self.ESP_RAM_BLOCK} bytes")
-                # print(f"\tLength of field: {length} bytes")
                 blocks = (length + self.ESP_RAM_BLOCK - 1) // self.ESP_RAM_BLOCK
-                # print(f"\tNumber of blocks to be written: {blocks}\tTotal Length:{length}")
                 self.mem_begin(length, blocks, self.ESP_RAM_BLOCK, offs)
                 for seq in range(blocks):
-                    self.flush_input()
-                    self._port.flush()
-                    self.sync()
                     from_offs = seq * self.ESP_RAM_BLOCK
                     to_offs = from_offs + self.ESP_RAM_BLOCK
-                    # print(f"\tBLOCK:{seq+1}\tRAM_BLOCK SIZE:{self.ESP_RAM_BLOCK}\tRANGE:[{from_offs}:{to_offs}]")
                     self.mem_block(field[from_offs:to_offs], seq)
         print("Running stub...")
         self.mem_finish(stub.entry)
+        try:
+            p = self.read()
+        except StopIteration:
+            raise FatalError(
+                "Failed to start stub. There was no response."
+                "\nTry increasing timeouts, for more information see: "
+                "https://docs.espressif.com/projects/esptool/en/latest/esptool/configuration-file.html"  # noqa E501
+            )
 
-        p = self.read()
         if p != b"OHAI":
-            raise FatalError("Failed to start stub. Unexpected response: %s" % p)
+            raise FatalError(f"Failed to start stub. Unexpected response: {p}")
         print("Stub running...")
         return self.STUB_CLASS(self)
 
@@ -989,14 +1053,25 @@ class ESPLoader(object):
 
     @stub_and_esp32_function_only
     def flash_defl_block(self, data, seq, timeout=DEFAULT_TIMEOUT):
-        """Write block to flash, send compressed"""
-        self.check_command(
-            "write compressed data to flash after seq %d" % seq,
-            self.ESP_FLASH_DEFL_DATA,
-            struct.pack("<IIII", len(data), seq, 0, 0) + data,
-            self.checksum(data),
-            timeout=timeout,
-        )
+        """Write block to flash, send compressed, retry if fail"""
+        for attempts_left in range(WRITE_BLOCK_ATTEMPTS - 1, -1, -1):
+            try:
+                self.check_command(
+                    "write compressed data to flash after seq %d" % seq,
+                    self.ESP_FLASH_DEFL_DATA,
+                    struct.pack("<IIII", len(data), seq, 0, 0) + data,
+                    self.checksum(data),
+                    timeout=timeout,
+                )
+                break
+            except FatalError:
+                if attempts_left:
+                    self.trace(
+                        "Compressed block write failed, "
+                        f"retrying with {attempts_left} attempts left"
+                    )
+                else:
+                    raise
 
     @stub_and_esp32_function_only
     def flash_defl_finish(self, reboot=False):
@@ -1372,9 +1447,7 @@ class ESPLoader(object):
 
     def hard_reset(self):
         print("Hard resetting via RTS pin...")
-        self._setRTS(True)  # EN->LOW
-        time.sleep(0.1)
-        self._setRTS(False)
+        HardReset(self._port)()
 
     def soft_reset(self, stay_in_bootloader):
         if not self.IS_STUB:
@@ -1424,57 +1497,102 @@ def slip_reader(port, trace_function):
     Designed to avoid too many calls to serial.read(1), which can bog
     down on slow systems.
     """
-    wait_count = 0
+
+    def detect_panic_handler(input):
+        """
+        Checks the input bytes for panic handler messages.
+        Raises a FatalError if Guru Meditation or Fatal Exception is found, as both
+        of these are used between different ROM versions.
+        Tries to also parse the error cause (e.g. IllegalInstruction).
+        """
+
+        guru_meditation = (
+            rb"G?uru Meditation Error: (?:Core \d panic'ed \(([a-zA-Z ]*)\))?"
+        )
+        fatal_exception = rb"F?atal exception \(\d+\): (?:([a-zA-Z ]*)?.*epc)?"
+
+        # Search either for Guru Meditation or Fatal Exception
+        data = re.search(
+            rb"".join([rb"(?:", guru_meditation, rb"|", fatal_exception, rb")"]),
+            input,
+            re.DOTALL,
+        )
+        if data is not None:
+            cause = [
+                "({})".format(i.decode("utf-8"))
+                for i in [data.group(1), data.group(2)]
+                if i is not None
+            ]
+            cause = f" {cause[0]}" if len(cause) else ""
+            msg = f"Guru Meditation Error detected{cause}"
+            raise FatalError(msg)
+
+    # print("In slip reader, waiting for response...")
     partial_packet = None
     in_escape = False
     successful_slip = False
+    slip_timeout = 5
+    sync_timeout = 3
+    max_retries = 5
+    start = time.time()
+    prev_time = 0
+    retries = 0
     while True:
-        waiting = port.inWaiting()
-        read_bytes = port.read(1 if waiting == 0 else waiting)
+        elapsed_time = int(time.time() - start)
+        read_bytes = port.read(1)
         if read_bytes == b"":
-            time.sleep(1/port.baudrate)
-            if wait_count < 150000: 
-                wait_count += 1
-                
-                # Case for TX flashing
-                if port.port == "/dev/ttyUSB0":
-                    if wait_count > 100 and current_op == ESPLoader.ESP_SYNC:
-                        # We raise an error here to start another connection attempt sequence instead of waiting 
-                        # for this current one to timeout, we don't catch errors in main though so this essentially 
-                        # does nothing but allow us to exit this function without causing the program to crash
-                        raise FatalError("Waiting for SYNC")
-                    
-                # Case for RX flashing through SLPI (J19 on voxl2)
-                elif port.port == "/dev/slpi-uart-7":
-                    if wait_count > 1000 and current_op == ESPLoader.ESP_SYNC:
-                        raise FatalError("Waiting for SYNC")
-                
-                continue
-            else:
+            if prev_time != elapsed_time and elapsed_time%1 == 0:
+                prev_time = elapsed_time
+
+            if elapsed_time > sync_timeout and current_op == ESPLoader.ESP_SYNC:
+                raise FatalError("Waiting for SYNC")
+
+            if elapsed_time > slip_timeout and retries > max_retries:
                 if partial_packet is None:  # fail due to no data
                     msg = (
-                        f"Serial data stream stopped: Possible serial noise or corruption.\tWait count: {wait_count}\nPartial Packet:{partial_packet}\nWaiting:{waiting}"
+                        "Serial data stream stopped: Possible serial noise or corruption."
                         if successful_slip
-                        else f"No serial data received. Wait count: {wait_count}. Current OP: {current_op}"
+                        else "No serial data received."
                     )
                 else:  # fail during packet transfer
                     msg = "Packet content transfer stopped (received {} bytes)".format(
                         len(partial_packet)
                     )
                 trace_function(msg)
-                raise FatalError(msg)
+                yield [0x01]
+                start = time.time()
+                retries = 0
+                prev_time = 0
+
+            elif elapsed_time > slip_timeout:
+                start = time.time()
+                prev_time = 0
+                retries+=1
+                continue
+
         trace_function("Read %d bytes: %s", len(read_bytes), HexFormatter(read_bytes))
         for b in read_bytes:
+            trace_function("Read %d bytes: %s", len(read_bytes), HexFormatter(read_bytes))
             b = bytes([b])
             if partial_packet is None:  # waiting for packet header
                 if b == b"\xc0":
                     partial_packet = b""
                 else:
                     trace_function("Read invalid data: %s", HexFormatter(read_bytes))
+                    remaining_data = port.read(port.inWaiting())
                     trace_function(
                         "Remaining data in serial buffer: %s",
-                        HexFormatter(port.read(port.inWaiting())),
+                        HexFormatter(remaining_data),
                     )
+                    port.flush()
+                    continue 
+                    trace_function("Read invalid data: %s", HexFormatter(read_bytes))
+                    remaining_data = port.read(port.inWaiting())
+                    trace_function(
+                        "Remaining data in serial buffer: %s",
+                        HexFormatter(remaining_data),
+                    )
+                    detect_panic_handler(read_bytes + remaining_data)
                     raise FatalError(
                         "Invalid head of packet (0x%s): "
                         "Possible serial noise or corruption." % hexify(b)
@@ -1487,17 +1605,20 @@ def slip_reader(port, trace_function):
                     partial_packet += b"\xdb"
                 else:
                     trace_function("Read invalid data: %s", HexFormatter(read_bytes))
+                    remaining_data = port.read(port.inWaiting())
                     trace_function(
                         "Remaining data in serial buffer: %s",
-                        HexFormatter(port.read(port.inWaiting())),
+                        HexFormatter(remaining_data),
                     )
+                    detect_panic_handler(read_bytes + remaining_data)
                     raise FatalError("Invalid SLIP escape (0xdb, 0x%s)" % (hexify(b)))
             elif b == b"\xdb":  # start of escape sequence
                 in_escape = True
             elif b == b"\xc0":  # end of packet
                 trace_function("Received full packet: %s", HexFormatter(partial_packet))
-                # print(f"Wait count: {wait_count}")
                 yield partial_packet
+                retries = 0
+                start = time.time()
                 partial_packet = None
                 successful_slip = True
             else:  # normal byte in packet
