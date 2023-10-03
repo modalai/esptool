@@ -37,7 +37,7 @@ class VoxlSerialPort():
     initialized   = False
     _baudrate      = 0
     port          = ''
-    port_num      = 7
+    port_num      = 17
     parity        = 0
     bytesize      = 8
     stopbits      = 1
@@ -91,29 +91,10 @@ class VoxlSerialPort():
     def write(self, data):
         if not self.initialized:
             raise Exception('port is not initialized')
-        # If data is larger than rx buffer on SLPI side, break into smaller chunks before writing
-        if len(data) > self.write_buf_size:
-            blocks = (len(data) + self.write_buf_size - 1) // self.write_buf_size
-            for block in range(blocks):
-                from_offs = block * self.write_buf_size
-                to_offs = from_offs + self.write_buf_size
+        data = np.array(data)
+        data_ptr = data.ctypes.data_as(ct.POINTER(ct.c_uint8))
+        voxl_uart_write(self.port_num,data_ptr,data.nbytes)
 
-                # Prevent index out of range
-                if to_offs > len(data):
-                    to_offs = len(data) + 1
-
-                data_slice = np.array(data[from_offs:to_offs])
-                data_ptr = data_slice.ctypes.data_as(ct.POINTER(ct.c_uint8))
-                voxl_uart_write(self.port_num,data_ptr,data_slice.nbytes)
-
-        # Write normally
-        else:
-            data = np.array(data)
-            data_ptr = data.ctypes.data_as(ct.POINTER(ct.c_uint8))
-            voxl_uart_write(self.port_num,data_ptr,data.nbytes)
-
-        # Give some time for SLPI to read and respond after writing
-        time.sleep(0.013)
 
     def flush(self):
         voxl_uart_flush(self.port_num)

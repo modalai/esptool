@@ -99,6 +99,10 @@ WRITE_BLOCK_ATTEMPTS = cfg.getint("write_block_attempts", 3)
 # Current operation used for quicker connecting 
 current_op = None   
 
+# Voxl2 QRB5165 SLPI write buffer is 64 bytes
+SLPI_WRITE_BUF = 64
+
+
 STUBS_DIR = os.path.join(os.path.dirname(__file__), "targets", "stub_flasher")
 
 
@@ -307,6 +311,7 @@ class ESPLoader(object):
                         import voxl_serial
                         self._port = voxl_serial.VoxlSerialPort()
                         self._port.port = "/dev/slpi-uart-7"
+                        self._port.port_num = 17
                         self._port.baudrate = 115200
                         self._port.open()
                         self._port.flush()
@@ -358,7 +363,30 @@ class ESPLoader(object):
             + b"\xc0"
         )
         self.trace("Write %d bytes: %s", len(buf), HexFormatter(buf))
-        self._port.write(buf)
+        if self._port.port == "/dev/slpi-uart-7":
+            # If packet is larger than rx buffer on SLPI side, break into smaller chunks before writing
+            if len(buf) > SLPI_WRITE_BUF:
+                blocks = (len(buf) + SLPI_WRITE_BUF- 1) // SLPI_WRITE_BUF
+                for block in range(blocks):
+                    from_offs = block * SLPI_WRITE_BUF
+                    to_offs = from_offs + SLPI_WRITE_BUF
+    
+                    # Prevent index out of range
+                    if to_offs > len(buf):
+                        to_offs = len(buf) + 1
+
+                    self._port.write(buf[from_offs:to_offs])
+
+                    # Give some time for SLPI to read and respond after writing
+                    time.sleep(0.013)
+
+            # Write normally
+            else:
+                self._port.write(buf)
+                time.sleep(0.013)
+
+        else:
+            self._port.write(buf)
 
     def trace(self, message, *format_args):
         if self._trace_enabled:
@@ -627,7 +655,7 @@ class ESPLoader(object):
             return (USBJTAGSerialReset(self._port),)
 
         # USB-to-Serial bridge
-        if os.name != "nt" and not self._port.name.startswith("rfc2217:"):
+        if os.name != "nt" and not self._port.port.startswith("rfc2217:"):
             return (
                 UnixTightReset(self._port, delay),
                 UnixTightReset(self._port, extra_delay),
