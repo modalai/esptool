@@ -312,7 +312,7 @@ class ESPLoader(object):
                         self._port = voxl_serial.VoxlSerialPort()
                         self._port.port = "/dev/slpi-uart-7"
                         self._port.port_num = 17
-                        self._port.baudrate = 115200
+                        self._port.baudrate = baud
                         self._port.open()
                         self._port.flush()
                     except Exception as e:
@@ -328,7 +328,7 @@ class ESPLoader(object):
         # CH341 driver on some Linux versions (this opens at 9600 then
         # sets), shouldn't matter for other platforms/drivers. See
         # https://github.com/espressif/esptool/issues/44#issuecomment-107094446
-        self._set_port_baudrate(baud)
+        if "slpi" not in self._port.port: self._set_port_baudrate(baud)
         self._trace_enabled = trace_enabled
         # set write timeout, to prevent esptool blocked at write forever.
         try:
@@ -363,7 +363,7 @@ class ESPLoader(object):
             + b"\xc0"
         )
         self.trace("Write %d bytes: %s", len(buf), HexFormatter(buf))
-        if self._port.port == "/dev/slpi-uart-7":
+        if "slpi" in self._port.port:
             # If packet is larger than rx buffer on SLPI side, break into smaller chunks before writing
             if len(buf) > SLPI_WRITE_BUF:
                 blocks = (len(buf) + SLPI_WRITE_BUF- 1) // SLPI_WRITE_BUF
@@ -381,6 +381,8 @@ class ESPLoader(object):
             else:
                 self._port.write(buf)
 
+            # Give some time for SLPI to read and respond after writing
+            time.sleep(0.013)
         else:
             self._port.write(buf)
 
