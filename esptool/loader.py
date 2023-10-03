@@ -377,13 +377,9 @@ class ESPLoader(object):
 
                     self._port.write(buf[from_offs:to_offs])
 
-                    # Give some time for SLPI to read and respond after writing
-                    time.sleep(0.013)
-
             # Write normally
             else:
                 self._port.write(buf)
-                time.sleep(0.013)
 
         else:
             self._port.write(buf)

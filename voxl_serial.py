@@ -1,6 +1,5 @@
 import ctypes as ct
 import numpy as np
-import time
 
 libvoxl_io = ct.CDLL("libvoxl_io.so")
 
@@ -30,14 +29,14 @@ voxl_uart_flush = libvoxl_io.voxl_uart_flush
 voxl_uart_flush.argtypes = [ct.c_int]
 voxl_uart_flush.restype  = ct.c_int
 
-
+SLPI_QUP7_UART = 17
 
 
 class VoxlSerialPort():
     initialized   = False
     _baudrate      = 0
     port          = ''
-    port_num      = 17
+    port_num      = SLPI_QUP7_UART
     parity        = 0
     bytesize      = 8
     stopbits      = 1
