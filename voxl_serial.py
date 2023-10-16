@@ -29,6 +29,11 @@ voxl_uart_flush = libvoxl_io.voxl_uart_flush
 voxl_uart_flush.argtypes = [ct.c_int]
 voxl_uart_flush.restype  = ct.c_int
 
+# Peek bytes available
+voxl_uart_bytes_available = libvoxl_io.voxl_uart_bytes_available
+voxl_uart_bytes_available.argtypes = [ct.c_int]
+voxl_uart_bytes_available.restype = ct.c_int
+
 SLPI_QUP7_UART = 17
 
 
@@ -97,6 +102,9 @@ class VoxlSerialPort():
 
     def flush(self):
         voxl_uart_flush(self.port_num)
+
+    def peek(self):
+        return voxl_uart_bytes_available(self.port_num)
 
     # The functions below are not implemented in libqrb5165 so we need these fake functions to avoid error messages when flashing ESP based receivers
     def flushInput(self):

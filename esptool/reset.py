@@ -73,6 +73,34 @@ class ClassicReset(ResetStrategy):
         self._setDTR(False)  # IO0=HIGH, done
 
 
+class Voxl2Reset(ResetStrategy):
+    """
+    Classic reset sequence, sets DTR and RTS lines sequentially.
+    """
+
+    def _set_port_baudrate(self, baud):
+        self.port.baudrate = baud
+
+    def __call__(self):
+        import ctypes as ct
+        uint8_t = ct.c_uint8
+        data_out = (uint8_t * 6)()
+        data_out[0] = 0xEC  # ADDR -> RECEIVER
+        data_out[1] = 0x04  # LEN  -> 4 BYTES
+        data_out[2] = 0x32  # TYPE -> CMD
+        data_out[3] = 0x62  # COM1 -> 'b'
+        data_out[4] = 0x6C  # COM2 -> 'l'
+        data_out[5] = 0x0A  # CRC  ->  10
+        self._set_port_baudrate(420000)
+        self.port.flush()
+        time.sleep(1)
+        self.port.write(bytearray(data_out))
+        print("Rebooting to ROM bootloader...")
+        self._set_port_baudrate(460800)
+        self.port.flush()
+        time.sleep(1)
+
+
 class UnixTightReset(ResetStrategy):
     """
     UNIX-only reset sequence with custom implementation,

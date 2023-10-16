@@ -22,6 +22,7 @@ from .reset import (
     HardReset,
     USBJTAGSerialReset,
     UnixTightReset,
+    Voxl2Reset,
 )
 from .util import FatalError, NotImplementedInROMError, UnsupportedCommandError
 from .util import byte, hexify, mask_to_shift, pad_to, strip_chip_name
@@ -93,7 +94,7 @@ MEM_END_ROM_TIMEOUT = cfg.getfloat("mem_end_rom_timeout", 0.2)
 # Timeout for serial port write
 DEFAULT_SERIAL_WRITE_TIMEOUT = cfg.getfloat("serial_write_timeout", 10)
 # Default number of times to try connection
-DEFAULT_CONNECT_ATTEMPTS = cfg.getint("connect_attempts", 7)
+DEFAULT_CONNECT_ATTEMPTS = cfg.getint("connect_attempts", 3)
 # Number of times to try writing a data block
 WRITE_BLOCK_ATTEMPTS = cfg.getint("write_block_attempts", 3)
 # Current operation used for quicker connecting 
@@ -449,6 +450,7 @@ class ESPLoader(object):
                     if p[0] == 0x01:
                         self.sync()
                     self.write(pkt)
+                    time.sleep(0.5)
                     continue
                 (resp, op_ret, len_ret, val) = struct.unpack("<BBHI", p[:8])
                 if resp != 1:
@@ -630,6 +632,10 @@ class ESPLoader(object):
         used ESP chip, external settings, and environment variables.
         Returns a tuple of one or more reset strategies to be tried sequentially.
         """
+
+        if mode == "no_reset" and self._port.port == "/dev/slpi-uart-7":
+            return (Voxl2Reset(self._port, DEFAULT_RESET_DELAY),)
+        
         cfg_custom_reset_sequence = cfg.get("custom_reset_sequence")
         if cfg_custom_reset_sequence is not None:
             return (CustomReset(self._port, cfg_custom_reset_sequence),)
@@ -693,6 +699,10 @@ class ESPLoader(object):
                 last_error = self._connect_attempt(reset_strategy, mode)
                 if last_error is None:
                     break
+                # Didn't hear back 
+                print("Retrying to connect...")
+                reset_strategy()
+
         finally:
             print("")  # end 'Connecting...' line
 
@@ -1565,7 +1575,8 @@ def slip_reader(port, trace_function):
     retries = 0
     while True:
         elapsed_time = int(time.time() - start)
-        read_bytes = port.read(1)
+        bytes_available = port.peek()
+        read_bytes = port.read(bytes_available if bytes_available > 0 else 1)
         if read_bytes == b"":
             if prev_time != elapsed_time and elapsed_time%1 == 0:
                 prev_time = elapsed_time
