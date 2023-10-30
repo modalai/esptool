@@ -1575,8 +1575,8 @@ def slip_reader(port, trace_function):
     retries = 0
     while True:
         elapsed_time = int(time.time() - start)
-        bytes_available = port.peek()
-        read_bytes = port.read(bytes_available if bytes_available > 0 else 1)
+        # bytes_available = port.peek() # Peek function not supported for regular UART which breaks TX flashing...
+        read_bytes = port.read(1)
         if read_bytes == b"":
             if prev_time != elapsed_time and elapsed_time%1 == 0:
                 prev_time = elapsed_time
