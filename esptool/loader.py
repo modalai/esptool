@@ -309,8 +309,8 @@ class ESPLoader(object):
             try:
                 if port == "/dev/slpi-uart-7":
                     try:
-                        import voxl_serial
-                        self._port = voxl_serial.VoxlSerialPort()
+                        import voxl_elrs_tools.voxl_serial
+                        self._port = voxl_elrs_tools.voxl_serial.VoxlSerialPort()
                         self._port.port = "/dev/slpi-uart-7"
                         self._port.port_num = 17
                         self._port.baudrate = baud
